@@ -89,7 +89,8 @@ end
 if fid_log == 1
     logmsg = @(varargin) fprintf(1, varargin{:});
 else
-    logmsg = @(varargin) cellfun(@(f) fprintf(f, varargin{:}), {1, fid_log});
+    logmsg = @(varargin) cellfun(@(f) fprintf(f, varargin{:}), ...
+                            {1, fid_log}, 'UniformOutput', false);
 end
 
 logmsg('n_dummy = %d\n\n', n_dummy);
