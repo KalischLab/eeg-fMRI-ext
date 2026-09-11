@@ -62,19 +62,193 @@ tsnr_long <- tsnr |>
 head(tsnr_long)
 ```
 
-## Restrict to runs 1, 2 and 6, relabelled as days
+## Run-to-day mapping
 
-Runs 1, 2 and 6 are the first resting-state scan of each of the three
-acquisition days. The mapping is taken from the acquisition loop in
-`eeg_fmri_ext_SNR_2.sh` (`ses-Day1_task-rest1`, `ses-Day2_task-rest2`,
-`ses-Day3_task-rest6`), and the EEG status from `eeg_fmri_ext_SNR_1.m`
-("restscans 1, 6: without EEG; 2, 3, 4, 5: with EEG"):
+Taken from the acquisition loop in the data-generating scripts
+(`eeg_fmri_ext_SNR_1_v2.m:63` and `eeg_fmri_ext_SNR_2_v2.sh:61`, both
+`rest_day = [1 2 2 2 2 3]`), with the EEG status from
+`eeg_fmri_ext_SNR_1_v2.m:62` ("1, 6: without EEG; 2, 3, 4, 5: with EEG"):
 
-| Run | Session | Label here | EEG |
-|-----|---------|-----------|-----|
-| 1 | `ses-Day1_task-rest1` | Day 1 | no |
-| 2 | `ses-Day2_task-rest2` | Day 2 | **yes** |
-| 6 | `ses-Day3_task-rest6` | Day 3 | no |
+| Run | Session | EEG |
+|-----|---------|-----|
+| 1 | `ses-Day1_task-rest1` | no |
+| 2 | `ses-Day2_task-rest2` | **yes** |
+| 3 | `ses-Day2_task-rest3` | **yes** |
+| 4 | `ses-Day2_task-rest4` | **yes** |
+| 5 | `ses-Day2_task-rest5` | **yes** |
+| 6 | `ses-Day3_task-rest6` | no |
+
+Two questions follow from this, and they are analysed separately below:
+
+1. **Across days** — runs 1, 2 and 6, i.e. the first resting-state scan of each
+   day, one run per day. This is the session-stability question.
+2. **Within Day 2** — runs 2 to 5, the four EEG runs of the middle session.
+   This asks whether tSNR drifts over the course of the EEG session.
+
+## Helpers: plotting and significance annotation
+
+Both analyses produce the same kind of figure (echo blocks on the x-axis, the
+grouping factor within each block) and the same kind of post-hoc table, so the
+plot and the significance brackets are written once here and reused.
+
+Brackets are drawn only for the **within-echo** comparisons that survive Holm
+correction: `***` *p* < .001, `**` *p* < .01, `*` *p* < .05. Non-significant
+comparisons are left unmarked. Each bracket sits just above the data of its own
+echo block rather than at a single panel-wide height — echo 1 has roughly three
+times the tSNR of echo 4, so one common height would strand the echo-4 brackets
+far above their boxes.
+
+```{r helpers}
+p_stars <- function(p) {
+  ifelse(p < 0.001, "***",
+  ifelse(p < 0.01,  "**",
+  ifelse(p < 0.05,  "*", NA_character_)))
+}
+
+# Lowest free vertical tier per bracket, so that overlapping spans stack
+# instead of being drawn on top of each other.
+pack_tiers <- function(xmin, xmax, pad = 0.35) {
+  tier <- integer(length(xmin))
+  for (i in seq_along(xmin)) {
+    j <- seq_len(i - 1L)
+    t <- 1L
+    while (any(tier[j] == t & xmin[i] <= xmax[j] + pad & xmax[i] >= xmin[j] - pad)) {
+      t <- t + 1L
+    }
+    tier[i] <- t
+  }
+  tier
+}
+
+# x-axis cells: one box per echo x group combination, ordered echo-major so the
+# groups being compared sit next to each other.
+add_cells <- function(d) {
+  d   <- d |> mutate(echo = droplevels(echo), grp = droplevels(grp))
+  lev <- paste0(rep(levels(d$echo), each = nlevels(d$grp)), "_", levels(d$grp))
+  d |> mutate(
+    cell = factor(paste0(as.character(echo), "_", as.character(grp)), levels = lev)
+  )
+}
+
+# pw: within-echo pairwise table with columns echo, group1, group2, p.adj.
+# Returns a list of layers, empty if nothing is significant.
+sig_geom <- function(pw, d, step_frac = 0.055, tick_frac = 0.014) {
+  grp  <- levels(d$grp)
+  span <- diff(range(d$tSNR))
+  step <- step_frac * span
+  tick <- tick_frac * span
+
+  y_echo <- d |>
+    group_by(echo) |>
+    summarise(y0 = max(tSNR), .groups = "drop") |>
+    mutate(echo = as.character(echo))
+
+  b <- pw |>
+    ungroup() |>
+    mutate(label = p_stars(p.adj), echo = as.character(echo)) |>
+    filter(!is.na(label)) |>
+    mutate(
+      e    = match(echo, levels(d$echo)),
+      xmin = (e - 1) * length(grp) + pmin(match(group1, grp), match(group2, grp)),
+      xmax = (e - 1) * length(grp) + pmax(match(group1, grp), match(group2, grp))
+    ) |>
+    left_join(y_echo, by = "echo") |>
+    arrange(e, xmax - xmin, xmin) |>
+    group_by(e) |>
+    mutate(tier = pack_tiers(xmin, xmax)) |>
+    ungroup() |>
+    mutate(y = y0 + tier * step)
+
+  if (nrow(b) == 0) return(list())
+
+  # Four points per bracket: down-tick, across, down-tick.
+  paths <- data.frame(
+    id = rep(seq_len(nrow(b)), each = 4),
+    x  = as.vector(rbind(b$xmin, b$xmin, b$xmax, b$xmax)),
+    y  = as.vector(rbind(b$y - tick, b$y, b$y, b$y - tick))
+  )
+
+  list(
+    geom_path(
+      data = paths, aes(x = x, y = y, group = id),
+      colour = "black", linewidth = 0.4, inherit.aes = FALSE
+    ),
+    geom_text(
+      data = b, aes(x = (xmin + xmax) / 2, y = y, label = label),
+      vjust = -0.15, size = 4.6, colour = "black", inherit.aes = FALSE
+    ),
+    expand_limits(y = max(b$y) + 1.8 * step)
+  )
+}
+```
+
+Black boxes and points, no background grid, explicit x- and y-axis lines, and
+`base_size = 14` so the figure stays legible at A4 width. The x-axis is
+two-tiered: the grouping factor on the axis itself, echo beneath.
+
+```{r theme}
+base_font <- 14   # readable when the 8 x 5.5 in figure is placed on A4
+
+theme_tsnr <- theme_classic(base_size = base_font) +
+  theme(
+    panel.grid       = element_blank(),
+    axis.line        = element_line(colour = "black", linewidth = 0.5),
+    axis.ticks       = element_line(colour = "black", linewidth = 0.5),
+    axis.text        = element_text(colour = "black"),
+    axis.title       = element_text(colour = "black"),
+    axis.title.x     = element_text(margin = margin(t = 30)),
+    axis.title.y     = element_text(margin = margin(r = 8)),
+    plot.title       = element_text(face = "bold", size = base_font + 1),
+    plot.subtitle    = element_text(size = base_font - 2),
+    plot.caption     = element_text(size = base_font - 3, hjust = 0, colour = "grey30"),
+    plot.margin      = margin(6, 8, 14, 6)
+  )
+
+theme_set(theme_tsnr)
+```
+
+```{r panel-fn}
+tsnr_panel <- function(d, pw = NULL, title, subtitle, caption, x_title,
+                       short = identity) {
+  n_g <- nlevels(d$grp)
+
+  # One label per echo, centred under that echo's block of boxes.
+  echo_tier <- data.frame(
+    x     = (seq_len(nlevels(d$echo)) - 1) * n_g + (n_g + 1) / 2,
+    label = paste0("Echo ", levels(d$echo))
+  )
+
+  # Jitter is horizontal only, so no point is drawn at a false tSNR value.
+  p <- ggplot(d, aes(x = cell, y = tSNR)) +
+    geom_boxplot(
+      fill = "white", colour = "black",
+      linewidth = 0.5, width = 0.62,
+      outlier.shape = NA          # outliers are already shown as points below
+    ) +
+    geom_point(
+      position = position_jitter(width = 0.16, height = 0, seed = 42),
+      shape = 21, fill = "black", colour = "white",
+      size = 2.1, stroke = 0.35, alpha = 0.9
+    ) +
+    geom_text(
+      data = echo_tier, aes(x = x, y = -Inf, label = label),
+      vjust = 3.5, size = base_font / .pt, colour = "black",
+      inherit.aes = FALSE
+    ) +
+    scale_x_discrete(labels = \(z) short(sub("^[^_]+_", "", z))) +
+    scale_y_continuous(expand = expansion(mult = c(0.04, 0.06))) +
+    coord_cartesian(clip = "off") +
+    labs(
+      title = title, subtitle = subtitle, caption = caption,
+      x = x_title, y = "tSNR (grey matter)"
+    )
+
+  if (!is.null(pw)) p <- p + sig_geom(pw, d)
+  p
+}
+```
+
+# Part 1: across days (runs 1, 2, 6)
 
 ```{r subset}
 runs_keep <- c(1, 2, 6)
@@ -96,7 +270,8 @@ tsnr_rm <- tsnr_day |>
   group_by(ID) |>
   filter(dplyr::n() == n_cells) |>
   ungroup() |>
-  mutate(ID = factor(ID))
+  mutate(ID = factor(ID), grp = day) |>
+  add_cells()
 
 cat(
   "Complete cases: ", n_distinct(tsnr_rm$ID), " of ",
@@ -129,80 +304,6 @@ tsnr_rm |>
     .groups = "drop"
   ) |>
   mutate(across(mean:max, ~ round(.x, 2)))
-```
-
-## Plot
-
-Black boxes and points, no background grid, explicit x- and y-axis lines, and
-`base_size = 14` so the figure stays legible at A4 width. The x-axis is
-two-tiered: echo number on the axis itself, day beneath.
-
-```{r theme}
-base_font <- 14   # readable when the 8 x 5.5 in figure is placed on A4
-
-theme_tsnr <- theme_classic(base_size = base_font) +
-  theme(
-    panel.grid       = element_blank(),
-    axis.line        = element_line(colour = "black", linewidth = 0.5),
-    axis.ticks       = element_line(colour = "black", linewidth = 0.5),
-    axis.text        = element_text(colour = "black"),
-    axis.title       = element_text(colour = "black"),
-    axis.title.x     = element_text(margin = margin(t = 30)),
-    axis.title.y     = element_text(margin = margin(r = 8)),
-    plot.title       = element_text(face = "bold", size = base_font + 1),
-    plot.subtitle    = element_text(size = base_font - 2),
-    plot.caption     = element_text(size = base_font - 3, hjust = 0, colour = "grey30"),
-    plot.margin      = margin(6, 8, 14, 6)
-  )
-
-theme_set(theme_tsnr)
-```
-
-```{r plot, fig.width=8, fig.height=5.5}
-n_echo <- nlevels(tsnr_rm$echo)
-
-# One label per day, centred under that day's block of echoes.
-day_tier <- data.frame(
-  x     = seq_len(length(runs_keep)) * n_echo - (n_echo - 1) / 2,
-  label = day_labels
-)
-
-# Jitter is horizontal only, so no point is drawn at a false tSNR value.
-set.seed(42)
-
-p_tsnr <- ggplot(tsnr_rm, aes(x = scan, y = tSNR)) +
-  geom_boxplot(
-    fill = "white", colour = "black",
-    linewidth = 0.5, width = 0.62,
-    outlier.shape = NA          # outliers are already shown as points below
-  ) +
-  geom_point(
-    position = position_jitter(width = 0.16, height = 0, seed = 42),
-    shape = 21, fill = "black", colour = "white",
-    size = 2.1, stroke = 0.35, alpha = 0.9
-  ) +
-  geom_text(
-    data = day_tier, aes(x = x, y = -Inf, label = label),
-    vjust = 3.5, size = base_font / .pt, colour = "black",
-    inherit.aes = FALSE
-  ) +
-  scale_x_discrete(labels = \(z) sub("^r\\d+e", "", z)) +
-  scale_y_continuous(expand = expansion(mult = c(0.04, 0.06))) +
-  coord_cartesian(clip = "off") +
-  labs(
-    title    = "Temporal SNR by echo and acquisition day",
-    subtitle = "Each dot is one subject; Day 2 is the session acquired with EEG",
-    x        = "Echo",
-    y        = "tSNR (grey matter)",
-    caption  = paste0("n = ", n_distinct(tsnr_rm$ID), " subjects with complete data")
-  )
-
-p_tsnr
-```
-
-```{r plot-save, include=FALSE}
-# Vector copy at A4 text width, for inclusion in a manuscript.
-ggsave("tSNR_boxplot.pdf", p_tsnr, width = 17, height = 12, units = "cm")
 ```
 
 ## Two-way repeated-measures ANOVA
@@ -241,18 +342,59 @@ tsnr_rm |>
 
 ### Post-hoc comparisons
 
-Paired *t*-tests between days, Holm-corrected. First collapsed across echoes
-(follow-up to the day main effect), then within each echo (follow-up to the
-interaction).
+Paired *t*-tests between days, Holm-corrected. First as a follow-up to the day
+main effect, then within each echo as a follow-up to the interaction.
 
-```{r posthoc}
-pairwise_t_test(tsnr_rm, tSNR ~ day, paired = TRUE, p.adjust.method = "holm") |>
+For the main-effect follow-up the four echoes of a subject are averaged into one
+value per subject and day *before* the test. Testing the un-averaged rows would
+treat each echo as an independent replicate and give *df* =
+`r nlevels(tsnr_rm$echo) * n_distinct(tsnr_rm$ID) - 1`
+instead of `r n_distinct(tsnr_rm$ID) - 1`, which inflates the *t* statistics.
+
+```{r posthoc-day}
+day_posthoc <- tsnr_rm |>
+  group_by(ID, day) |>
+  summarise(tSNR = mean(tSNR), .groups = "drop") |>
+  pairwise_t_test(tSNR ~ day, paired = TRUE, p.adjust.method = "holm")
+
+day_posthoc |>
   select(group1, group2, statistic, df, p, p.adj, p.adj.signif)
+```
 
-tsnr_rm |>
+Within each echo — these are the comparisons annotated on the figure:
+
+```{r posthoc-echo}
+day_by_echo <- tsnr_rm |>
   group_by(echo) |>
-  pairwise_t_test(tSNR ~ day, paired = TRUE, p.adjust.method = "holm") |>
+  pairwise_t_test(tSNR ~ day, paired = TRUE, p.adjust.method = "holm")
+
+day_by_echo |>
   select(echo, group1, group2, statistic, df, p, p.adj, p.adj.signif)
+```
+
+## Plot
+
+```{r plot, fig.width=8, fig.height=5.5}
+p_tsnr <- tsnr_panel(
+  tsnr_rm,
+  pw       = day_by_echo,
+  title    = "Temporal SNR by echo and acquisition day",
+  subtitle = "Each dot is one subject; Day 2 is the session acquired with EEG",
+  x_title  = "Acquisition day",
+  caption  = paste0(
+    "n = ", n_distinct(tsnr_rm$ID), " subjects with complete data.\n",
+    "Brackets: Holm-corrected paired t-tests within echo; unmarked = ns.\n",
+    "*** p < .001    ** p < .01    * p < .05"
+  ),
+  short = \(s) sub("^Day ", "D", s)
+)
+
+p_tsnr
+```
+
+```{r plot-save, include=FALSE}
+# Vector copy at A4 text width, for inclusion in a manuscript.
+ggsave("tSNR_boxplot.pdf", p_tsnr, width = 17, height = 12, units = "cm")
 ```
 
 ### Size of the day differences, per echo
@@ -261,15 +403,17 @@ The interaction is easier to read as a proportion, because tSNR itself differs
 by a factor of three across echoes.
 
 ```{r pct-change}
-tsnr_rm |>
+pct_day <- tsnr_rm |>
   group_by(echo, day) |>
   summarise(mean = mean(tSNR), .groups = "drop") |>
   pivot_wider(names_from = day, values_from = mean) |>
   mutate(
     `Day 2 vs Day 1 (%)` = 100 * (`Day 2` - `Day 1`) / `Day 1`,
-    `Day 3 vs Day 1 (%)` = 100 * (`Day 3` - `Day 1`) / `Day 1`,
-    across(where(is.numeric), ~ round(.x, 2))
+    `Day 3 vs Day 1 (%)` = 100 * (`Day 3` - `Day 1`) / `Day 1`
   )
+
+pct_day |>
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
 ```
 
 ### Is the interaction just a scaling effect?
@@ -277,64 +421,279 @@ tsnr_rm |>
 An equal *proportional* change across echoes would still show up as an
 interaction in absolute units, since echo 1 has three times the tSNR of echo 4.
 Refitting on `log(tSNR)` turns proportional effects into additive ones, so if
-the interaction were purely a scaling artefact it would disappear here.
+the interaction is purely a scaling artefact it disappears here.
 
 ```{r log-check}
-tsnr_rm |>
+fit_log <- tsnr_rm |>
   mutate(log_tSNR = log(tSNR)) |>
-  anova_test(dv = log_tSNR, wid = ID, within = c(day, echo)) |>
+  anova_test(dv = log_tSNR, wid = ID, within = c(day, echo))
+
+get_anova_table(fit_log, correction = "auto")
+```
+
+# Part 2: within Day 2 (runs 2-5)
+
+All four runs of the Day 2 session were acquired with the EEG cap in place. If
+the cap, or cap-related drift (gel drying, subject settling, heating), degraded
+tSNR progressively, it should show up as a run effect here.
+
+```{r day2-subset}
+runs_d2   <- 2:5
+run_labels <- paste("Rest", runs_d2)
+
+tsnr_d2_all <- tsnr_long |>
+  filter(run %in% runs_d2) |>
+  mutate(
+    run_f = factor(run, levels = runs_d2, labels = run_labels),
+    scan  = droplevels(scan),
+    echo  = droplevels(echo)
+  )
+
+n_cells_d2 <- length(runs_d2) * nlevels(tsnr_d2_all$echo)
+
+tsnr_d2 <- tsnr_d2_all |>
+  group_by(ID) |>
+  filter(dplyr::n() == n_cells_d2) |>
+  ungroup() |>
+  mutate(ID = factor(ID), grp = run_f) |>
+  add_cells()
+
+cat(
+  "Complete cases: ", n_distinct(tsnr_d2$ID), " of ",
+  n_distinct(tsnr_d2_all$ID), " subjects with any Day 2 run\n", sep = ""
+)
+```
+
+```{r day2-dropped}
+tsnr_d2_all |>
+  group_by(ID) |>
+  filter(dplyr::n() < n_cells_d2) |>
+  summarise(runs_present = paste(sort(unique(run)), collapse = ", "), .groups = "drop")
+```
+
+## Summary statistics
+
+```{r day2-summary}
+tsnr_d2 |>
+  group_by(echo, run_f) |>
+  summarise(
+    n      = dplyr::n(),
+    mean   = mean(tSNR),
+    sd     = sd(tSNR),
+    median = median(tSNR),
+    IQR    = IQR(tSNR),
+    min    = min(tSNR),
+    max    = max(tSNR),
+    .groups = "drop"
+  ) |>
+  mutate(across(mean:max, ~ round(.x, 2)))
+```
+
+## Two-way repeated-measures ANOVA
+
+**run** (4 levels: rest2-rest5) and **echo** (4 levels) are both within-subject.
+Same model as Part 1, with run in place of day.
+
+```{r day2-anova}
+fit_d2 <- anova_test(tsnr_d2, dv = tSNR, wid = ID, within = c(run_f, echo))
+
+get_anova_table(fit_d2, correction = "auto")
+```
+
+Sphericity:
+
+```{r day2-sphericity}
+fit_d2$`Mauchly's Test for Sphericity`
+
+fit_d2$`Sphericity Corrections`
+```
+
+### Marginal means
+
+```{r day2-marginals}
+tsnr_d2 |>
+  group_by(run_f) |>
+  summarise(mean = round(mean(tSNR), 2), sd = round(sd(tSNR), 2), .groups = "drop")
+
+tsnr_d2 |>
+  group_by(echo) |>
+  summarise(mean = round(mean(tSNR), 2), sd = round(sd(tSNR), 2), .groups = "drop")
+```
+
+### Post-hoc comparisons
+
+Reported for completeness even though the omnibus run effect is not significant,
+so they should be read as descriptive rather than confirmatory. Subject means
+across echoes for the main-effect follow-up, as in Part 1.
+
+```{r day2-posthoc-run}
+tsnr_d2 |>
+  group_by(ID, run_f) |>
+  summarise(tSNR = mean(tSNR), .groups = "drop") |>
+  pairwise_t_test(tSNR ~ run_f, paired = TRUE, p.adjust.method = "holm") |>
+  select(group1, group2, statistic, df, p, p.adj, p.adj.signif)
+```
+
+Within each echo — these are the comparisons annotated on the Day 2 figure:
+
+```{r day2-posthoc-echo}
+run_by_echo <- tsnr_d2 |>
+  group_by(echo) |>
+  pairwise_t_test(tSNR ~ run_f, paired = TRUE, p.adjust.method = "holm")
+
+run_by_echo |>
+  select(echo, group1, group2, statistic, df, p, p.adj, p.adj.signif)
+```
+
+```{r day2-nsig, echo=FALSE}
+n_sig_d2 <- sum(run_by_echo$p.adj < 0.05)
+cat("Within-echo run comparisons surviving Holm correction: ", n_sig_d2,
+    " of ", nrow(run_by_echo), "\n", sep = "")
+```
+
+## Plot
+
+```{r day2-plot, fig.width=8, fig.height=5.5}
+p_d2 <- tsnr_panel(
+  tsnr_d2,
+  pw       = run_by_echo,
+  title    = "Temporal SNR across the four EEG runs of Day 2",
+  subtitle = "Each dot is one subject; all four runs acquired with the EEG cap in place",
+  x_title  = "Resting-state run (Day 2)",
+  caption  = paste0(
+    "n = ", n_distinct(tsnr_d2$ID), " subjects with all four Day 2 runs.\n",
+    "Brackets: Holm-corrected paired t-tests within echo; unmarked = ns.\n",
+    if (n_sig_d2 == 0) "No within-echo comparison was significant, so no bracket is drawn."
+    else "*** p < .001    ** p < .01    * p < .05"
+  ),
+  short = \(s) sub("^Rest ", "R", s)
+)
+
+p_d2
+```
+
+```{r day2-plot-save, include=FALSE}
+ggsave("tSNR_boxplot_day2.pdf", p_d2, width = 17, height = 12, units = "cm")
+```
+
+### Size of the run differences, per echo
+
+Relative to rest2, the first EEG run of the session.
+
+```{r day2-pct}
+pct_d2 <- tsnr_d2 |>
+  group_by(echo, run_f) |>
+  summarise(mean = mean(tSNR), .groups = "drop") |>
+  pivot_wider(names_from = run_f, values_from = mean) |>
+  mutate(
+    `Rest 3 vs Rest 2 (%)` = 100 * (`Rest 3` - `Rest 2`) / `Rest 2`,
+    `Rest 4 vs Rest 2 (%)` = 100 * (`Rest 4` - `Rest 2`) / `Rest 2`,
+    `Rest 5 vs Rest 2 (%)` = 100 * (`Rest 5` - `Rest 2`) / `Rest 2`
+  )
+
+pct_d2 |>
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+```
+
+### Log check
+
+```{r day2-log-check}
+tsnr_d2 |>
+  mutate(log_tSNR = log(tSNR)) |>
+  anova_test(dv = log_tSNR, wid = ID, within = c(run_f, echo)) |>
   get_anova_table(correction = "auto")
 ```
 
-## Summary of observed effects
+# Summary of observed effects
 
 ```{r summary-numbers, include=FALSE}
-at   <- get_anova_table(fit, correction = "auto")
-gv   <- function(eff, col) at[[col]][at$Effect == eff]
+at    <- get_anova_table(fit, correction = "auto")
+atl   <- get_anova_table(fit_log, correction = "auto")
+at2   <- get_anova_table(fit_d2, correction = "auto")
+gv    <- function(tab, eff, col) tab[[col]][tab$Effect == eff]
 n_sub <- n_distinct(tsnr_rm$ID)
+
+em    <- function(e) round(mean(tsnr_rm$tSNR[tsnr_rm$echo == e]), 1)
+dm    <- function(d) round(mean(tsnr_rm$tSNR[tsnr_rm$day  == d]), 1)
+rm2m  <- function(r) round(mean(tsnr_d2$tSNR[tsnr_d2$run_f == r]), 1)
+
+# Day 2 cost, as a percentage of the mean of the two non-EEG days.
+d2_cost <- 100 * (dm("Day 2") - mean(c(dm("Day 1"), dm("Day 3")))) /
+  mean(c(dm("Day 1"), dm("Day 3")))
+pct_rng <- range(pct_day$`Day 2 vs Day 1 (%)`)
+d13_rng <- range(abs(pct_day$`Day 3 vs Day 1 (%)`))
+fmt_p   <- function(p) ifelse(p < 0.001, "< .001", paste0("= ", format(round(p, 3), nsmall = 3)))
 ```
 
-**Echo dominates.** tSNR falls monotonically with echo number — `r round(mean(tsnr_rm$tSNR[tsnr_rm$echo == 1]), 1)`
-(echo 1), `r round(mean(tsnr_rm$tSNR[tsnr_rm$echo == 2]), 1)`,
-`r round(mean(tsnr_rm$tSNR[tsnr_rm$echo == 3]), 1)`, and
-`r round(mean(tsnr_rm$tSNR[tsnr_rm$echo == 4]), 1)` (echo 4) — a very large
-effect (*F*(`r round(gv("echo","DFn"),2)`, `r round(gv("echo","DFd"),2)`) =
-`r round(gv("echo","F"),1)`, *p* < .001, ges = `r round(gv("echo","ges"),3)`).
-This is the expected T2\* decay: later echoes have longer TE, so less signal
-remains while thermal noise stays roughly constant. It is a property of the
-sequence, not a data-quality finding.
+**Echo dominates.** tSNR falls monotonically with echo number — `r em(1)`
+(echo 1), `r em(2)`, `r em(3)`, and `r em(4)` (echo 4) — a very large effect
+(*F*(`r round(gv(at,"echo","DFn"),2)`, `r round(gv(at,"echo","DFd"),2)`) =
+`r round(gv(at,"echo","F"),1)`, *p* < .001,
+ges = `r round(gv(at,"echo","ges"),3)`). This is the expected T2\* decay: later
+echoes have longer TE, so less signal remains while thermal noise stays roughly
+constant. It is a property of the sequence, not a data-quality finding.
 
-**No effect of day.** Collapsed across echoes, mean tSNR is
-`r round(mean(tsnr_rm$tSNR[tsnr_rm$day == "Day 1"]), 1)` (Day 1),
-`r round(mean(tsnr_rm$tSNR[tsnr_rm$day == "Day 2"]), 1)` (Day 2) and
-`r round(mean(tsnr_rm$tSNR[tsnr_rm$day == "Day 3"]), 1)` (Day 3):
-*F*(`r round(gv("day","DFn"),2)`, `r round(gv("day","DFd"),2)`) =
-`r round(gv("day","F"),2)`, *p* = `r round(gv("day","p"),3)`,
-ges = `r round(gv("day","ges"),3)`. No pairwise comparison survives correction.
-Image quality is stable across the three sessions, which is the reassuring
-result for a multi-day design.
+**Day 2 loses about `r round(abs(d2_cost), 0)`% of its tSNR.** Collapsed across
+echoes, mean tSNR is `r dm("Day 1")` (Day 1), `r dm("Day 2")` (Day 2) and
+`r dm("Day 3")` (Day 3):
+*F*(`r round(gv(at,"day","DFn"),2)`, `r round(gv(at,"day","DFd"),2)`) =
+`r round(gv(at,"day","F"),2)`, *p* `r fmt_p(gv(at,"day","p"))`,
+ges = `r round(gv(at,"day","ges"),3)`. The post-hoc pattern is unambiguous:
+Day 1 > Day 2 and Day 3 > Day 2 both survive correction, while Day 1 vs Day 3 is
+nowhere near significance (*p* =
+`r format(round(day_posthoc$p.adj[day_posthoc$group1 == "Day 1" & day_posthoc$group2 == "Day 3"], 2), nsmall = 2)`).
+Day 2 is the EEG session and the only session that differs; the two non-EEG days
+are statistically indistinguishable, differing by at most
+`r round(d13_rng[2], 1)`% in any echo. The loss is present in **every** echo
+(all 8 Day-2 contrasts in the figure survive Holm correction), and the magnitude
+is stable: `r round(abs(pct_rng[2]), 1)`% to `r round(abs(pct_rng[1]), 1)`%
+across the four echoes.
 
-**A small day × echo interaction.**
-*F*(`r round(gv("day:echo","DFn"),2)`, `r round(gv("day:echo","DFd"),2)`) =
-`r round(gv("day:echo","F"),2)`, *p* = `r round(gv("day:echo","p"),3)`,
-ges = `r round(gv("day:echo","ges"),3)`. It is carried by echo 1, which loses
-about 3.6% of its tSNR on Day 2 (73.9 → 71.2) and recovers on Day 3 (74.5),
-while echoes 2–4 vary by roughly 2% and do not dip. The interaction survives the
-log transform, so it is not merely the consequence of echo 1 sitting on a larger
-scale. Day 2 is the EEG session, and an EEG cap plausibly costs signal in the
-shortest-TE echo first — but with *p* just under .05, ges = 0.007, and no
-surviving post-hoc contrast, this should be treated as a hint to check rather
-than an established effect. Runs 3–5 (also EEG, same day) are available and
-would be the natural test of whether the echo-1 dip is reproducible.
+**The day x echo interaction is a scaling artefact.** In absolute units it is
+significant
+(*F*(`r round(gv(at,"day:echo","DFn"),2)`, `r round(gv(at,"day:echo","DFd"),2)`) =
+`r round(gv(at,"day:echo","F"),2)`, *p* `r fmt_p(gv(at,"day:echo","p"))`,
+ges = `r round(gv(at,"day:echo","ges"),3)`), but on the log scale it drops to
+*F*(`r round(gv(atl,"day:echo","DFn"),2)`, `r round(gv(atl,"day:echo","DFd"),2)`) =
+`r round(gv(atl,"day:echo","F"),2)`, *p* `r fmt_p(gv(atl,"day:echo","p"))`,
+ges = `r signif(gv(atl,"day:echo","ges"),2)` — not significant. So the effect is
+a constant *proportional* loss on Day 2, which looks like an interaction only
+because echo 1 sits on a three-times-larger scale. That is the signature of a
+multiplicative signal loss (or a noise gain) affecting all echoes equally,
+consistent with the EEG cap and its leads rather than with anything TE-specific.
 
-Practically: the design is safe to pool across days, and echo weighting for the
-multi-echo combination can use the same weights on each day.
+**The EEG penalty does not drift within the session.** Across the four Day 2
+runs, mean tSNR is `r rm2m("Rest 2")` (rest2), `r rm2m("Rest 3")`,
+`r rm2m("Rest 4")` and `r rm2m("Rest 5")` (rest5):
+*F*(`r round(gv(at2,"run_f","DFn"),2)`, `r round(gv(at2,"run_f","DFd"),2)`) =
+`r round(gv(at2,"run_f","F"),2)`, *p* `r fmt_p(gv(at2,"run_f","p"))`,
+ges = `r round(gv(at2,"run_f","ges"),3)`, and the run x echo interaction is also
+null (*p* `r fmt_p(gv(at2,"run_f:echo","p"))`,
+ges = `r signif(gv(at2,"run_f:echo","ges"),2)`). `r n_sig_d2` of
+`r nrow(run_by_echo)` within-echo run comparisons survive correction, which is
+why the Day 2 figure carries no brackets. Rest3 is nominally the lowest run
+(about `r round(abs(mean(pct_d2$"Rest 3 vs Rest 2 (%)")), 1)`% below rest2 in
+every echo), but it does not survive correction and rest4 and rest5 return to
+the rest2 level, so this is noise rather than a trend.
 
-### Does averaging tSNR over voxels make sense?
+Taken together: the cost is attached to *having the cap on*, not to how long it
+has been on. It appears at full size in the first EEG run and stays flat for the
+rest of the session.
+
+**Practical consequences.** Pooling resting-state runs across days is no longer
+safe without accounting for session: a systematic
+`r round(abs(d2_cost), 0)`% tSNR difference between the EEG day and the two
+non-EEG days will propagate into any between-session comparison of effect sizes
+or variance. Include session as a covariate, or restrict within-subject
+contrasts to runs from the same day. Echo weighting for the multi-echo
+combination, on the other hand, *can* use the same weights on each day — the
+loss is proportional across echoes, so the relative weighting is unchanged.
+
+## Does averaging tSNR over voxels make sense?
 
 Partly. What is being analysed here is one number per subject, run and echo: the
 mean of the voxelwise tSNR map inside that subject's grey-matter mask
-(`fslstats -k … -M` in `eeg_fmri_ext_SNR_2.sh:104`). For the question actually
+(`fslstats -k … -M` in `eeg_fmri_ext_SNR_2_v2.sh`). For the question actually
 being asked — *is image quality stable across sessions, and how does it scale
 with echo?* — that is the right summary. It is a single scalar per cell, so the
 repeated-measures ANOVA above is exactly the correct test, it has real power at
@@ -347,38 +706,44 @@ The averaging does, however, hide the things most likely to matter:
   orbitofrontal and inferior temporal regions, where susceptibility dropout is
   worst. A stable global mean is compatible with a real loss confined to those
   regions.
-- **Losses that trade off spatially cancel.** If the EEG cap costs tSNR near the
-  electrodes (superficial, occipital and frontal cortex) while deeper voxels are
-  unchanged, the global mean moves by very little — which may be exactly what the
-  small echo-1 effect is.
+- **The global mean cannot localise the Day 2 loss.** A uniform
+  `r round(abs(d2_cost), 0)`% drop in the GM mean is equally consistent with a
+  uniform `r round(abs(d2_cost), 0)`% drop everywhere and with a much larger
+  loss confined to electrode-adjacent cortex, offset by unchanged deep voxels.
+  Those two possibilities have very different implications for whether task
+  activation on Day 2 is comparable to the other days.
 - **The mean is not where the optimal echo weighting lives.** Optimal T2\*
   weighting is voxelwise, since T2\* varies regionally; a global mean per echo
   cannot inform it.
 
-### Does a voxel-wise analysis make sense?
+## Does a voxel-wise analysis make sense?
 
-Yes, and it is worth doing as a complement rather than a replacement — the maps
-already exist (`*_bold_tSNR_masked.nii.gz`), so the marginal cost is low. It
-answers the question the global mean cannot: *where* does tSNR change. The
-sensible route is to normalise each subject's tSNR maps to a common template,
-then fit the same day × echo model voxelwise (SPM flexible factorial, or FSL
-randomise for a non-parametric test), with cluster- or TFCE-based correction for
-multiple comparisons.
+Yes, and now it is the obvious next step rather than an optional complement.
+Part 1 establishes *that* Day 2 costs tSNR; the maps already exist
+(`*_bold_tSNR_masked.nii.gz`), so answering *where* is cheap. The sensible route
+is to normalise each subject's tSNR maps to a common template, then fit the same
+day x echo model voxelwise (SPM flexible factorial, or FSL randomise for a
+non-parametric test), with cluster- or TFCE-based correction.
 
-Two things to plan for. First, the multiple-comparison penalty is real: a
-whole-brain voxelwise test of the ~2% day effect seen here will very likely find
-nothing, because the effect is small and diffuse rather than focal. Second, tSNR
-maps are smooth and heavy-tailed, so a non-parametric or log-transformed test is
-safer than assuming normality per voxel.
+The prospects are much better than they were for a `r round(abs(d2_cost), 0)`%
+effect that was borderline in the omnibus test. Here the day effect is
+significant with ges = `r round(gv(at,"day","ges"),3)` and consistent across all
+four echoes, so a voxelwise test is looking for something that is already known
+to be present in the average — the question is only how it is distributed. Two
+things still to plan for: tSNR maps are smooth and heavy-tailed, so a
+non-parametric or log-transformed test is safer than assuming normality per
+voxel; and because the effect is proportional, the voxelwise model should be fit
+on `log(tSNR)` so that a uniform relative loss appears as a uniform additive
+shift instead of tracking baseline tSNR.
 
-Given that, the most informative middle path is probably neither extreme: keep
-the global GM mean as the omnibus quality check, and add a small set of
-*a priori* ROI means — an occipital/electrode-adjacent ROI, a dropout-prone
-orbitofrontal ROI, and a deep/central ROI — analysed with the same day × echo
-model. That directly tests the EEG-proximity hypothesis suggested by the echo-1
-dip, at a fraction of the correction burden of a whole-brain search. A full
-voxelwise map is then best used descriptively, to show the spatial distribution
-of tSNR per echo, rather than as the inferential test.
+The specific hypothesis worth testing is spatial: if the loss is caused by the
+cap, it should be largest in superficial cortex near the electrodes and smallest
+in deep and central structures. A small set of *a priori* ROIs — an
+occipital/electrode-adjacent ROI, a dropout-prone orbitofrontal ROI, and a
+deep/central ROI — analysed with the same day x echo model, tests that directly
+at a fraction of the correction burden of a whole-brain search. A full voxelwise
+map is then best used descriptively, to show the spatial distribution of the
+Day 2 loss.
 
 ## Session info
 
