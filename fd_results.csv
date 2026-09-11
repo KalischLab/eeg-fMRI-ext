@@ -1,0 +1,2 @@
+ID,run,day,n_vols,mean_FD,max_FD,n_FD_gt_0.5,pct_FD_gt_0.5
+sub-10,1,1,325,0.108875,0.981483,4,1.231
