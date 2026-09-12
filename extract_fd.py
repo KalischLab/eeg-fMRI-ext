@@ -33,7 +33,7 @@ import sys
 from pathlib import Path
 
 FD_COLUMN = "framewise_displacement"
-DEFAULT_PATTERN = "*_desc-confounds_timeseries.tsv"
+DEFAULT_PATTERN = "*rest*_desc-confounds_timeseries.tsv"
 
 # Run -> acquisition day, from eeg_fmri_ext_SNR_1_v2.m:63 (rest_day = [1 2 2 2 2 3]).
 # Only used to cross-check the ses-<label> entity in the filename; the filename
