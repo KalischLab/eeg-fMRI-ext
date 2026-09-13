@@ -25,10 +25,10 @@ library(knitr)
 source("qc_plot_helpers.R")
 theme_set(qc_theme())
 
-# PNG copies of the figures, for the GitHub-readable summary (RESULTS.md).
+# Figures are written to figures/ as PNG, so that they render on GitHub in
+# RESULTS.md. 17 x 12 cm is A4 text width, i.e. manuscript size.
 dir.create("figures", showWarnings = FALSE)
 save_fig <- function(name, plot, w = 17, h = 12) {
-  ggsave(paste0(name, ".pdf"), plot, width = w, height = h, units = "cm")
   ggsave(file.path("figures", paste0(name, ".png")), plot,
          width = w, height = h, units = "cm", dpi = 200)
 }
