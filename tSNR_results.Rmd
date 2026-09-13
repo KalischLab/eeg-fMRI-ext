@@ -20,6 +20,14 @@ library(tidyr)
 library(dplyr)
 library(rstatix)
 library(knitr)
+
+# PNG copies of the figures, for the GitHub-readable summary (RESULTS.md).
+dir.create("figures", showWarnings = FALSE)
+save_fig <- function(name, plot, w = 17, h = 12) {
+  ggsave(paste0(name, ".pdf"), plot, width = w, height = h, units = "cm")
+  ggsave(file.path("figures", paste0(name, ".png")), plot,
+         width = w, height = h, units = "cm", dpi = 200)
+}
 ```
 
 ## Read the data
@@ -394,7 +402,7 @@ p_tsnr
 
 ```{r plot-save, include=FALSE}
 # Vector copy at A4 text width, for inclusion in a manuscript.
-ggsave("tSNR_boxplot.pdf", p_tsnr, width = 17, height = 12, units = "cm")
+save_fig("tSNR_boxplot", p_tsnr)
 ```
 
 ### Size of the day differences, per echo
@@ -573,7 +581,7 @@ p_d2
 ```
 
 ```{r day2-plot-save, include=FALSE}
-ggsave("tSNR_boxplot_day2.pdf", p_d2, width = 17, height = 12, units = "cm")
+save_fig("tSNR_boxplot_day2", p_d2)
 ```
 
 ### Size of the run differences, per echo

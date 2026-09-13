@@ -1,0 +1,661 @@
+---
+title: "Framewise displacement across days and runs"
+author: "Benjamin Meyer"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 8, fig.height = 5.5, dpi = 200,
+  dev.args = list(bg = "white")
+)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(rstatix)
+library(knitr)
+
+# Plotting helpers shared with the tSNR report.
+source("qc_plot_helpers.R")
+theme_set(qc_theme())
+
+# PNG copies of the figures, for the GitHub-readable summary (RESULTS.md).
+dir.create("figures", showWarnings = FALSE)
+save_fig <- function(name, plot, w = 17, h = 12) {
+  ggsave(paste0(name, ".pdf"), plot, width = w, height = h, units = "cm")
+  ggsave(file.path("figures", paste0(name, ".png")), plot,
+         width = w, height = h, units = "cm", dpi = 200)
+}
+```
+
+This is the tSNR analysis repeated on head motion, with the echo factor removed:
+framewise displacement is estimated once per BOLD series, so there is one value
+per subject and run rather than one per echo. Two dependent variables are carried
+through in parallel, **mean FD** and **max FD**, both in mm.
+
+## Read the data
+
+`fd_results.csv` is the long-format output of `extract_fd.py`: one row per
+subject and run, with the acquisition day taken from the `ses-` entity of the
+confounds filename.
+
+```{r read}
+fd <- read.csv("fd_results.csv") |>
+  mutate(ID = factor(ID), run = as.integer(run), day = as.integer(day))
+
+str(fd)
+```
+
+```{r coverage}
+fd |>
+  group_by(run, day) |>
+  summarise(
+    n_subjects  = dplyr::n(),
+    n_vols      = paste0(min(n_vols), if (min(n_vols) != max(n_vols)) paste0("-", max(n_vols)) else ""),
+    .groups = "drop"
+  )
+```
+
+Runs differ slightly in length — 325 volumes on Days 1 and 3, 333 on Day 2. Mean
+FD is an average and so unaffected; max FD is an extreme value and could in
+principle be biased upwards by a longer run, but the difference is 2.5% of the
+series and max FD is essentially uncorrelated with run length across the dataset
+(Spearman *r* = `r round(cor(fd$max_FD, fd$n_vols, method = "spearman"), 3)`), so
+it is not a material confound.
+
+## Run-to-day mapping
+
+Unchanged from the tSNR report (`eeg_fmri_ext_SNR_1_v2.m:63`,
+`rest_day = [1 2 2 2 2 3]`; runs 2-5 carry EEG):
+
+| Run | Session | EEG |
+|-----|---------|-----|
+| 1 | `ses-Day1_task-rest1` | no |
+| 2 | `ses-Day2_task-rest2` | **yes** |
+| 3 | `ses-Day2_task-rest3` | **yes** |
+| 4 | `ses-Day2_task-rest4` | **yes** |
+| 5 | `ses-Day2_task-rest5` | **yes** |
+| 6 | `ses-Day3_task-rest6` | no |
+
+The same two questions as before: **across days** (runs 1, 2, 6 — one run per
+day) and **within Day 2** (runs 2-5 — the four EEG runs).
+
+## Choice of test
+
+The tSNR report used a repeated-measures ANOVA, and that is kept here as the
+primary test so the two reports are comparable. FD, however, is a strictly
+positive, right-skewed quantity — max FD especially, since it is the largest of
+~330 values — so the normality assumption needs checking rather than assuming.
+Each analysis below therefore reports, alongside the ANOVA:
+
+- **Shapiro-Wilk on the paired differences**, which is the assumption the
+  repeated-measures ANOVA and paired *t*-tests actually rest on;
+- **Friedman's test with Kendall's *W***, the rank-based equivalent of the
+  one-way within-subject ANOVA (the "non-parametric test?" noted in
+  `instructions.md`);
+- **Wilcoxon signed-rank post-hocs** next to the paired *t*-tests.
+
+Where the two disagree, the non-parametric result is the one to trust.
+
+```{r analysis-fns}
+# Prepare one analysis set: pick the runs, label the grouping factor, keep only
+# subjects with a value in every cell (the design is fully within-subject).
+prep_fd <- function(dat, dv, runs, labels) {
+  out <- dat |>
+    filter(run %in% runs) |>
+    mutate(grp = factor(run, levels = runs, labels = labels),
+           y   = .data[[dv]])
+  complete <- out |>
+    group_by(ID) |>
+    filter(dplyr::n() == length(runs)) |>
+    ungroup() |>
+    mutate(ID = droplevels(ID))
+  attr(complete, "n_all") <- n_distinct(out$ID)
+  add_cells(complete)
+}
+
+# Every test for one analysis set.
+fd_fit <- function(d) {
+  wide <- d |>
+    select(ID, grp, y) |>
+    pivot_wider(names_from = grp, values_from = y)
+  ref  <- wide[[2]]
+  diffs <- lapply(wide[-(1:2)], function(col) col - ref)
+  shapiro <- data.frame(
+    comparison = paste(names(wide)[-(1:2)], "-", names(wide)[2]),
+    W          = sapply(diffs, function(x) unname(shapiro.test(x)$statistic)),
+    p          = sapply(diffs, function(x) shapiro.test(x)$p.value),
+    row.names  = NULL
+  )
+
+  list(
+    aov      = anova_test(d, dv = y, wid = ID, within = grp),
+    friedman = friedman_test(d, y ~ grp | ID),
+    kendall  = friedman_effsize(d, y ~ grp | ID),
+    t_ph     = pairwise_t_test(d, y ~ grp, paired = TRUE, p.adjust.method = "holm"),
+    w_ph     = pairwise_wilcox_test(d, y ~ grp, paired = TRUE, p.adjust.method = "holm"),
+    aov_log  = anova_test(mutate(d, y = log(y)), dv = y, wid = ID, within = grp),
+    shapiro  = shapiro
+  )
+}
+
+# Descriptives in the same shape as the tSNR summary tables.
+fd_summary <- function(d) {
+  d |>
+    group_by(grp) |>
+    summarise(
+      n      = dplyr::n(),
+      mean   = mean(y), sd = sd(y),
+      median = median(y), IQR = IQR(y),
+      min    = min(y), max = max(y),
+      .groups = "drop"
+    ) |>
+    mutate(across(mean:max, ~ round(.x, 4)))
+}
+
+# Percent change relative to the first level.
+fd_pct <- function(d) {
+  d |>
+    group_by(grp) |>
+    summarise(mean = mean(y), .groups = "drop") |>
+    mutate(`change vs first (%)` = round(100 * (mean - first(mean)) / first(mean), 2),
+           mean = round(mean, 4))
+}
+
+# Caption noting how many comparisons were annotated.
+brk_caption <- function(n_sub, pw, extra = "") {
+  n_sig <- sum(pw$p.adj < 0.05)
+  paste0(
+    "n = ", n_sub, " subjects with complete data.", extra, "\n",
+    "Brackets: Holm-corrected paired t-tests; unmarked = ns.\n",
+    if (n_sig == 0) "No comparison was significant, so no bracket is drawn."
+    else "*** p < .001    ** p < .01    * p < .05"
+  )
+}
+
+day_runs   <- c(1, 2, 6)
+day_labels <- c("Day 1", "Day 2", "Day 3")
+d2_runs    <- 2:5
+d2_labels  <- paste("Rest", d2_runs)
+```
+
+# Part 1: across days (runs 1, 2, 6)
+
+```{r p1-prep}
+mean_day <- prep_fd(fd, "mean_FD", day_runs, day_labels)
+max_day  <- prep_fd(fd, "max_FD",  day_runs, day_labels)
+
+cat("Complete cases: ", n_distinct(mean_day$ID), " of ",
+    attr(mean_day, "n_all"), " subjects\n", sep = "")
+```
+
+Subjects excluded, and which of the three runs they have:
+
+```{r p1-dropped}
+fd |>
+  filter(run %in% day_runs) |>
+  group_by(ID) |>
+  filter(dplyr::n() < length(day_runs)) |>
+  summarise(runs_present = paste(sort(unique(run)), collapse = ", "), .groups = "drop")
+```
+
+## Mean FD
+
+```{r p1-mean-summary}
+fd_summary(mean_day)
+```
+
+```{r p1-mean-fit}
+f_mean_day <- fd_fit(mean_day)
+```
+
+Repeated-measures ANOVA, factor **day** (3 levels), Greenhouse-Geisser applied
+automatically where Mauchly's test indicates a sphericity violation:
+
+```{r p1-mean-anova}
+get_anova_table(f_mean_day$aov, correction = "auto")
+
+f_mean_day$aov$`Mauchly's Test for Sphericity`
+```
+
+Normality of the paired differences, and the rank-based equivalent:
+
+```{r p1-mean-np}
+f_mean_day$shapiro
+
+f_mean_day$friedman
+
+f_mean_day$kendall
+```
+
+Post-hoc comparisons, Holm-corrected — parametric and rank-based side by side:
+
+```{r p1-mean-posthoc}
+f_mean_day$t_ph |> select(group1, group2, statistic, df, p, p.adj, p.adj.signif)
+
+f_mean_day$w_ph |> select(group1, group2, statistic, p, p.adj, p.adj.signif)
+```
+
+```{r p1-mean-plot, fig.width=8, fig.height=5.5}
+p_mean_day <- qc_panel(
+  mean_day,
+  y_lab    = "Mean FD (mm)",
+  x_title  = "Acquisition day",
+  title    = "Mean framewise displacement by acquisition day",
+  subtitle = "Each dot is one subject; Day 2 is the session acquired with EEG",
+  caption  = brk_caption(n_distinct(mean_day$ID), f_mean_day$t_ph),
+  pw       = f_mean_day$t_ph
+)
+
+p_mean_day
+```
+
+```{r p1-mean-save, include=FALSE}
+save_fig("fd_mean_boxplot", p_mean_day)
+```
+
+```{r p1-mean-pct}
+fd_pct(mean_day)
+```
+
+Log check, since a proportional change is the more natural model for a positive
+quantity:
+
+```{r p1-mean-log}
+get_anova_table(f_mean_day$aov_log, correction = "auto")
+```
+
+## Max FD
+
+```{r p1-max-summary}
+fd_summary(max_day)
+```
+
+```{r p1-max-fit}
+f_max_day <- fd_fit(max_day)
+```
+
+```{r p1-max-anova}
+get_anova_table(f_max_day$aov, correction = "auto")
+
+f_max_day$aov$`Mauchly's Test for Sphericity`
+```
+
+```{r p1-max-np}
+f_max_day$shapiro
+
+f_max_day$friedman
+
+f_max_day$kendall
+```
+
+```{r p1-max-posthoc}
+f_max_day$t_ph |> select(group1, group2, statistic, df, p, p.adj, p.adj.signif)
+
+f_max_day$w_ph |> select(group1, group2, statistic, p, p.adj, p.adj.signif)
+```
+
+The y axis is logarithmic here: max FD spans more than an order of magnitude
+across subjects (`r round(min(max_day$y), 2)` to `r round(max(max_day$y), 2)` mm),
+and on a linear axis a single 5 mm outlier compresses every box into the bottom
+fifth of the panel. The boxes and points are the same data as everywhere else in
+this report, only the scale differs.
+
+```{r p1-max-plot, fig.width=8, fig.height=5.5}
+p_max_day <- qc_panel(
+  max_day,
+  y_lab    = "Max FD (mm, log scale)",
+  x_title  = "Acquisition day",
+  title    = "Maximal framewise displacement by acquisition day",
+  subtitle = "Each dot is one subject; Day 2 is the session acquired with EEG",
+  caption  = brk_caption(n_distinct(max_day$ID), f_max_day$t_ph),
+  pw       = f_max_day$t_ph,
+  log_y    = TRUE
+)
+
+p_max_day
+```
+
+```{r p1-max-save, include=FALSE}
+save_fig("fd_max_boxplot", p_max_day)
+```
+
+```{r p1-max-pct}
+fd_pct(max_day)
+```
+
+```{r p1-max-log}
+get_anova_table(f_max_day$aov_log, correction = "auto")
+```
+
+# Part 2: within Day 2 (runs 2-5)
+
+```{r p2-prep}
+mean_d2 <- prep_fd(fd, "mean_FD", d2_runs, d2_labels)
+max_d2  <- prep_fd(fd, "max_FD",  d2_runs, d2_labels)
+
+cat("Complete cases: ", n_distinct(mean_d2$ID), " of ",
+    attr(mean_d2, "n_all"), " subjects with any Day 2 run\n", sep = "")
+```
+
+```{r p2-dropped}
+fd |>
+  filter(run %in% d2_runs) |>
+  group_by(ID) |>
+  filter(dplyr::n() < length(d2_runs)) |>
+  summarise(runs_present = paste(sort(unique(run)), collapse = ", "), .groups = "drop")
+```
+
+## Mean FD
+
+```{r p2-mean-summary}
+fd_summary(mean_d2)
+```
+
+```{r p2-mean-fit}
+f_mean_d2 <- fd_fit(mean_d2)
+```
+
+```{r p2-mean-anova}
+get_anova_table(f_mean_d2$aov, correction = "auto")
+
+f_mean_d2$aov$`Mauchly's Test for Sphericity`
+```
+
+```{r p2-mean-np}
+f_mean_d2$shapiro
+
+f_mean_d2$friedman
+
+f_mean_d2$kendall
+```
+
+```{r p2-mean-posthoc}
+f_mean_d2$t_ph |> select(group1, group2, statistic, df, p, p.adj, p.adj.signif)
+
+f_mean_d2$w_ph |> select(group1, group2, statistic, p, p.adj, p.adj.signif)
+```
+
+```{r p2-mean-plot, fig.width=8, fig.height=5.5}
+p_mean_d2 <- qc_panel(
+  mean_d2,
+  y_lab    = "Mean FD (mm)",
+  x_title  = "Resting-state run (Day 2)",
+  title    = "Mean FD across the four EEG runs of Day 2",
+  subtitle = "Each dot is one subject; all four runs acquired with the EEG cap in place",
+  caption  = brk_caption(n_distinct(mean_d2$ID), f_mean_d2$t_ph),
+  pw       = f_mean_d2$t_ph,
+  short    = \(s) sub("^Rest ", "R", s)
+)
+
+p_mean_d2
+```
+
+```{r p2-mean-save, include=FALSE}
+save_fig("fd_mean_boxplot_day2", p_mean_d2)
+```
+
+```{r p2-mean-pct}
+fd_pct(mean_d2)
+```
+
+```{r p2-mean-log}
+get_anova_table(f_mean_d2$aov_log, correction = "auto")
+```
+
+## Max FD
+
+```{r p2-max-summary}
+fd_summary(max_d2)
+```
+
+```{r p2-max-fit}
+f_max_d2 <- fd_fit(max_d2)
+```
+
+```{r p2-max-anova}
+get_anova_table(f_max_d2$aov, correction = "auto")
+
+f_max_d2$aov$`Mauchly's Test for Sphericity`
+```
+
+```{r p2-max-np}
+f_max_d2$shapiro
+
+f_max_d2$friedman
+
+f_max_d2$kendall
+```
+
+```{r p2-max-posthoc}
+f_max_d2$t_ph |> select(group1, group2, statistic, df, p, p.adj, p.adj.signif)
+
+f_max_d2$w_ph |> select(group1, group2, statistic, p, p.adj, p.adj.signif)
+```
+
+```{r p2-max-plot, fig.width=8, fig.height=5.5}
+p_max_d2 <- qc_panel(
+  max_d2,
+  y_lab    = "Max FD (mm, log scale)",
+  x_title  = "Resting-state run (Day 2)",
+  title    = "Max FD across the four EEG runs of Day 2",
+  subtitle = "Each dot is one subject; all four runs acquired with the EEG cap in place",
+  caption  = brk_caption(n_distinct(max_d2$ID), f_max_d2$t_ph),
+  pw       = f_max_d2$t_ph,
+  log_y    = TRUE,
+  short    = \(s) sub("^Rest ", "R", s)
+)
+
+p_max_d2
+```
+
+```{r p2-max-save, include=FALSE}
+save_fig("fd_max_boxplot_day2", p_max_d2)
+```
+
+```{r p2-max-pct}
+fd_pct(max_d2)
+```
+
+```{r p2-max-log}
+get_anova_table(f_max_d2$aov_log, correction = "auto")
+```
+
+# Summary of observed effects
+
+```{r summary-numbers, include=FALSE}
+gv  <- function(fit, col, eff = "grp") {
+  tab <- get_anova_table(fit, correction = "auto")
+  tab[[col]][tab$Effect == eff]
+}
+fmt_p <- function(p) ifelse(p < 0.001, "< .001",
+                            paste0("= ", format(round(p, 3), nsmall = 3)))
+gm <- function(d, g) round(mean(d$y[d$grp == g]), 3)
+
+n_day <- n_distinct(mean_day$ID)
+n_d2  <- n_distinct(mean_d2$ID)
+
+# How many of all the post-hoc comparisons in the report survive correction.
+all_ph <- bind_rows(
+  f_mean_day$t_ph, f_max_day$t_ph, f_mean_d2$t_ph, f_max_d2$t_ph,
+  f_mean_day$w_ph, f_max_day$w_ph, f_mean_d2$w_ph, f_max_d2$w_ph
+)
+n_ph_sig <- sum(all_ph$p.adj < 0.05)
+
+min_shapiro_max <- min(c(f_max_day$shapiro$p, f_max_d2$shapiro$p))
+```
+
+**Head motion does not differ between the three acquisition days.** Mean FD is
+`r gm(mean_day, "Day 1")` mm (Day 1), `r gm(mean_day, "Day 2")` mm (Day 2) and
+`r gm(mean_day, "Day 3")` mm (Day 3). The ANOVA is nominally significant
+(*F*(`r round(gv(f_mean_day$aov,"DFn"),2)`, `r round(gv(f_mean_day$aov,"DFd"),2)`) =
+`r round(gv(f_mean_day$aov,"F"),2)`, *p* `r fmt_p(gv(f_mean_day$aov,"p"))`,
+ges = `r round(gv(f_mean_day$aov,"ges"),3)`), but that result does not hold up:
+no post-hoc comparison survives Holm correction (smallest
+*p*<sub>adj</sub> = `r round(min(f_mean_day$t_ph$p.adj), 3)`), Friedman's test on
+the same data gives *p* = `r round(f_mean_day$friedman$p, 3)` with Kendall's
+*W* = `r round(f_mean_day$kendall$effsize, 3)` (small), and the effect drops to
+*p* `r fmt_p(gv(f_mean_day$aov_log,"p"))` on the log scale. The nominal effect is
+carried by Day 3 being about
+`r round(fd_pct(mean_day)$"change vs first (%)"[3], 0)`% higher than Day 1, not by
+the EEG day. Max FD shows nothing at all
+(*F*(`r round(gv(f_max_day$aov,"DFn"),2)`, `r round(gv(f_max_day$aov,"DFd"),2)`) =
+`r round(gv(f_max_day$aov,"F"),2)`, *p* `r fmt_p(gv(f_max_day$aov,"p"))`;
+Friedman *p* = `r round(f_max_day$friedman$p, 3)`).
+
+**Motion is also flat across the four EEG runs of Day 2.** Mean FD declines
+slightly and monotonically after the first run — `r gm(mean_d2, "Rest 2")`,
+`r gm(mean_d2, "Rest 3")`, `r gm(mean_d2, "Rest 4")`, `r gm(mean_d2, "Rest 5")` mm
+— but neither the ANOVA
+(*F*(`r round(gv(f_mean_d2$aov,"DFn"),2)`, `r round(gv(f_mean_d2$aov,"DFd"),2)`) =
+`r round(gv(f_mean_d2$aov,"F"),2)`, *p* `r fmt_p(gv(f_mean_d2$aov,"p"))`,
+ges = `r round(gv(f_mean_d2$aov,"ges"),3)`) nor Friedman's test
+(*p* = `r round(f_mean_d2$friedman$p, 3)`) reaches significance, and no post-hoc
+survives correction. Max FD is equally null
+(*p* `r fmt_p(gv(f_max_d2$aov,"p"))`; Friedman *p* =
+`r round(f_max_d2$friedman$p, 3)`). There is no evidence of motion drift over the
+EEG session, and no evidence that subjects settle or deteriorate between runs.
+
+**In total, `r n_ph_sig` of `r nrow(all_ph)` post-hoc comparisons in this report
+survive Holm correction**, which is why none of the four figures carries a
+significance bracket.
+
+**A caveat on max FD.** The paired differences in max FD are strongly
+non-normal — Shapiro-Wilk *p* as low as
+`r format(signif(min_shapiro_max, 2), scientific = TRUE)` — because the measure
+is the largest of ~330 values and is dominated by isolated events (one subject
+reaches `r round(max(max_day$y), 1)` mm on Day 3, five times the group median).
+For max FD the Friedman and Wilcoxon results are therefore the primary ones, not
+the ANOVA. They agree with it here, so the conclusion is unaffected, but a future
+analysis with a real effect should not lean on the parametric test for this
+variable. Mean FD is much better behaved (Shapiro-Wilk *p* >
+`r round(min(f_mean_day$shapiro$p), 2)` for the day differences).
+
+# Does motion explain the Day 2 tSNR loss?
+
+This section is not part of the tSNR analysis being replicated; it is here
+because the FD result bears directly on how the tSNR result should be read. The
+tSNR report found a ~6% drop in grey-matter tSNR on Day 2, uniform across
+echoes. Motion is the obvious alternative explanation — a subject who moves more
+with a cap on would show lower tSNR for reasons having nothing to do with the
+cap's effect on the signal.
+
+The data above already argues against the simplest version of that: mean FD on
+Day 2 (`r gm(mean_day, "Day 2")` mm) is essentially identical to Day 1
+(`r gm(mean_day, "Day 1")` mm), *p* =
+`r round(f_mean_day$t_ph$p.adj[f_mean_day$t_ph$group1 == "Day 1" & f_mean_day$t_ph$group2 == "Day 2"], 3)`.
+A group-level tSNR drop cannot be produced by a group-level motion increase that
+did not happen. But that leaves a subtler possibility open: motion might still
+explain *which* subjects lost the most tSNR. Testing that needs the two tables
+joined.
+
+```{r motion-tsnr}
+tsnr_wide <- read.csv("tSNR_results.txt", na.strings = c("NA", "NaN", ""))
+names(tsnr_wide)[1] <- "ID"
+
+# tSNR averaged over the four echoes, for runs 1 and 2.
+tsnr_delta <- tsnr_wide |>
+  transmute(
+    ID     = ID,
+    tsnr_1 = rowMeans(across(c(r1e1, r1e2, r1e3, r1e4))),
+    tsnr_2 = rowMeans(across(c(r2e1, r2e2, r2e3, r2e4)))
+  ) |>
+  mutate(d_tsnr = tsnr_2 - tsnr_1)
+
+fd_delta <- fd |>
+  filter(run %in% c(1, 2)) |>
+  select(ID, run, mean_FD) |>
+  pivot_wider(names_from = run, values_from = mean_FD, names_prefix = "fd_") |>
+  mutate(d_fd = fd_2 - fd_1)
+
+joined <- inner_join(tsnr_delta, fd_delta, by = "ID") |>
+  filter(!is.na(d_tsnr), !is.na(d_fd))
+
+cat("Subjects with both measures on runs 1 and 2: ", nrow(joined), "\n", sep = "")
+```
+
+The change in motion and the change in tSNR *are* related across subjects:
+
+```{r motion-tsnr-cor}
+cor.test(joined$d_fd, joined$d_tsnr, method = "spearman")
+```
+
+So motion is not irrelevant. The question is whether it accounts for the *mean*
+drop or only for the spread around it. Regressing the tSNR change on the motion
+change separates the two: the slope is the motion contribution, and the
+intercept is the tSNR change expected for a subject whose motion did not change
+at all.
+
+```{r motion-tsnr-lm}
+fit_conf <- lm(d_tsnr ~ d_fd, data = joined)
+summary(fit_conf)
+```
+
+```{r motion-tsnr-plot, fig.width=6.5, fig.height=5}
+ggplot(joined, aes(x = d_fd, y = d_tsnr)) +
+  geom_hline(yintercept = 0, colour = "grey70", linewidth = 0.4) +
+  geom_vline(xintercept = 0, colour = "grey70", linewidth = 0.4) +
+  geom_smooth(method = "lm", formula = y ~ x, colour = "black",
+              linewidth = 0.5, fill = "grey85") +
+  geom_point(shape = 21, fill = "black", colour = "white", size = 2.6, stroke = 0.4) +
+  labs(
+    title    = "Change in motion vs change in tSNR, Day 1 to Day 2",
+    subtitle = "Each dot is one subject; tSNR averaged over the four echoes",
+    x        = "Change in mean FD (mm)",
+    y        = "Change in tSNR"
+  )
+```
+
+```{r motion-tsnr-save, include=FALSE}
+save_fig("fd_vs_tsnr_change", last_plot(), h = 13)
+```
+
+```{r motion-tsnr-numbers, include=FALSE}
+ct     <- cor.test(joined$d_fd, joined$d_tsnr, method = "spearman")
+cf     <- summary(fit_conf)$coefficients
+b0     <- cf["(Intercept)", "Estimate"];  p0 <- cf["(Intercept)", "Pr(>|t|)"]
+b1     <- cf["d_fd", "Estimate"];         p1 <- cf["d_fd", "Pr(>|t|)"]
+r2     <- summary(fit_conf)$r.squared
+n_up   <- sum(joined$d_fd > 0)
+mean_d <- mean(joined$d_tsnr)
+```
+
+**Both things are true, and they answer different questions.** Across the
+`r nrow(joined)` subjects with both measures, motion change does predict tSNR
+change, in the expected direction and with a respectable effect size: Spearman
+*rho* = `r round(unname(ct$estimate), 2)` (*p* = `r round(ct$p.value, 3)`), and
+in the regression the slope is significant (*b* = `r round(b1, 1)` tSNR units per
+mm of FD, *p* = `r round(p1, 3)`, R² = `r round(r2, 2)`). Subjects who moved more
+on Day 2 did lose more tSNR. Motion is a genuine contributor to the
+*subject-to-subject spread* in the Day 2 loss.
+
+It is not, however, the cause of the loss itself. The regression intercept — the
+expected tSNR change for a subject whose motion was identical on the two days —
+is `r round(b0, 2)` (*p* = `r format(round(p0, 4), nsmall = 4)`), against a raw
+mean change of `r round(mean_d, 2)`. In other words, essentially the entire mean
+drop remains at zero motion change. That is the expected result given the
+group-level numbers: only `r n_up` of `r nrow(joined)` subjects moved more on Day 2
+at all, and mean FD across the group was flat, so motion has no mean shift
+available to transmit to tSNR.
+
+The reading in the tSNR report therefore stands, with one refinement. The Day 2
+tSNR loss is a property of the EEG hardware being in the bore rather than of
+subjects behaving differently while wearing it — but motion still modulates how
+large that loss is for a given subject, and a study using per-subject Day 2 tSNR
+as a covariate would do well to include mean FD alongside it. Two caveats on this
+section specifically: n = `r nrow(joined)` is small for a correlation, so the
+slope estimate is imprecise; and FD and tSNR are not independent measurements,
+since motion enters the tSNR denominator directly through the temporal standard
+deviation.
+
+## Session info
+
+```{r session}
+sessionInfo()
+```
